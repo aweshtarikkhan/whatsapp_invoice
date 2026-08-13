@@ -23,6 +23,7 @@ if (!fs.existsSync(sessionsDir)) {
 export const activeSessions: Record<string, ReturnType<typeof makeWASocket>> = {};
 export const qrCodes: Record<string, string> = {}; // Base64 QR codes
 export const connectionStates: Record<string, string> = {}; // "connecting", "open", "close"
+const reconnectTimers: Record<string, any> = {}; // Debounce reconnection attempts
 
 export const getSessionStatus = async (orgId: string) => {
   const { data } = await supabase.from("whatsapp_sessions").select("status").eq("org_id", orgId).single();
@@ -31,6 +32,20 @@ export const getSessionStatus = async (orgId: string) => {
 
 export const startWhatsAppSession = async (orgId: string) => {
   console.log(`Starting WhatsApp session for org: ${orgId}`);
+  
+  // Clean up any existing socket first
+  const oldSock = activeSessions[orgId];
+  if (oldSock) {
+    try { oldSock.ev.removeAllListeners(); } catch(e) {}
+    try { oldSock.end(undefined); } catch(e) {}
+    delete activeSessions[orgId];
+  }
+  
+  // Clear any pending reconnect timer
+  if (reconnectTimers[orgId]) {
+    clearTimeout(reconnectTimers[orgId]);
+    delete reconnectTimers[orgId];
+  }
   
   const orgSessionDir = path.join(sessionsDir, orgId);
   const { state, saveCreds } = await useMultiFileAuthState(orgSessionDir);
@@ -56,6 +71,7 @@ export const startWhatsAppSession = async (orgId: string) => {
 
     if (connection) {
       connectionStates[orgId] = connection;
+      console.log(`[${orgId}] Connection state: ${connection}`);
     }
 
     if (qr) {
@@ -67,15 +83,29 @@ export const startWhatsAppSession = async (orgId: string) => {
     }
 
     if (connection === "close") {
-      const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-      console.log(`[${orgId}] Connection closed due to`, lastDisconnect?.error, ", reconnecting:", shouldReconnect);
+      const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      console.log(`[${orgId}] Connection closed (code: ${statusCode}), reconnecting: ${shouldReconnect}`);
       
       if (shouldReconnect) {
-        startWhatsAppSession(orgId);
+        // Debounced reconnect: wait 3 seconds, only one reconnect at a time
+        if (!reconnectTimers[orgId]) {
+          reconnectTimers[orgId] = setTimeout(async () => {
+            delete reconnectTimers[orgId];
+            console.log(`[${orgId}] Attempting reconnect...`);
+            try {
+              await startWhatsAppSession(orgId);
+            } catch (e) {
+              console.error(`[${orgId}] Reconnect failed:`, e);
+            }
+          }, 3000);
+        }
       } else {
         console.log(`[${orgId}] Logged out. Deleting session.`);
+        try { sock.ev.removeAllListeners(); } catch(e) {}
         delete activeSessions[orgId];
         delete qrCodes[orgId];
+        delete connectionStates[orgId];
         fs.rmSync(orgSessionDir, { recursive: true, force: true });
         await supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "disconnected" }, { onConflict: "org_id" });
       }
