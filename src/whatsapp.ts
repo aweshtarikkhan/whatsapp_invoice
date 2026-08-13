@@ -36,7 +36,6 @@ export const startWhatsAppSession = async (orgId: string) => {
   // Clean up any existing socket first
   const oldSock = activeSessions[orgId];
   if (oldSock) {
-    try { oldSock.ev.removeAllListeners(); } catch(e) {}
     try { oldSock.end(undefined); } catch(e) {}
     delete activeSessions[orgId];
   }
@@ -102,7 +101,6 @@ export const startWhatsAppSession = async (orgId: string) => {
         }
       } else {
         console.log(`[${orgId}] Logged out. Deleting session.`);
-        try { sock.ev.removeAllListeners(); } catch(e) {}
         delete activeSessions[orgId];
         delete qrCodes[orgId];
         delete connectionStates[orgId];

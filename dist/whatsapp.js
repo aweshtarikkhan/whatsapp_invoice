@@ -52,6 +52,7 @@ if (!fs_1.default.existsSync(sessionsDir)) {
 exports.activeSessions = {};
 exports.qrCodes = {}; // Base64 QR codes
 exports.connectionStates = {}; // "connecting", "open", "close"
+const reconnectTimers = {}; // Debounce reconnection attempts
 const getSessionStatus = async (orgId) => {
     const { data } = await supabase_1.supabase.from("whatsapp_sessions").select("status").eq("org_id", orgId).single();
     return data?.status || "disconnected";
@@ -59,6 +60,20 @@ const getSessionStatus = async (orgId) => {
 exports.getSessionStatus = getSessionStatus;
 const startWhatsAppSession = async (orgId) => {
     console.log(`Starting WhatsApp session for org: ${orgId}`);
+    // Clean up any existing socket first
+    const oldSock = exports.activeSessions[orgId];
+    if (oldSock) {
+        try {
+            oldSock.end(undefined);
+        }
+        catch (e) { }
+        delete exports.activeSessions[orgId];
+    }
+    // Clear any pending reconnect timer
+    if (reconnectTimers[orgId]) {
+        clearTimeout(reconnectTimers[orgId]);
+        delete reconnectTimers[orgId];
+    }
     const orgSessionDir = path_1.default.join(sessionsDir, orgId);
     const { state, saveCreds } = await (0, baileys_1.useMultiFileAuthState)(orgSessionDir);
     const { version, isLatest } = await (0, baileys_1.fetchLatestBaileysVersion)();
@@ -78,6 +93,7 @@ const startWhatsAppSession = async (orgId) => {
         const { connection, lastDisconnect, qr } = update;
         if (connection) {
             exports.connectionStates[orgId] = connection;
+            console.log(`[${orgId}] Connection state: ${connection}`);
         }
         if (qr) {
             console.log(`[${orgId}] New QR Code generated.`);
@@ -86,15 +102,29 @@ const startWhatsAppSession = async (orgId) => {
             await supabase_1.supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "authenticating" }, { onConflict: "org_id" });
         }
         if (connection === "close") {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== baileys_1.DisconnectReason.loggedOut;
-            console.log(`[${orgId}] Connection closed due to`, lastDisconnect?.error, ", reconnecting:", shouldReconnect);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const shouldReconnect = statusCode !== baileys_1.DisconnectReason.loggedOut;
+            console.log(`[${orgId}] Connection closed (code: ${statusCode}), reconnecting: ${shouldReconnect}`);
             if (shouldReconnect) {
-                (0, exports.startWhatsAppSession)(orgId);
+                // Debounced reconnect: wait 3 seconds, only one reconnect at a time
+                if (!reconnectTimers[orgId]) {
+                    reconnectTimers[orgId] = setTimeout(async () => {
+                        delete reconnectTimers[orgId];
+                        console.log(`[${orgId}] Attempting reconnect...`);
+                        try {
+                            await (0, exports.startWhatsAppSession)(orgId);
+                        }
+                        catch (e) {
+                            console.error(`[${orgId}] Reconnect failed:`, e);
+                        }
+                    }, 3000);
+                }
             }
             else {
                 console.log(`[${orgId}] Logged out. Deleting session.`);
                 delete exports.activeSessions[orgId];
                 delete exports.qrCodes[orgId];
+                delete exports.connectionStates[orgId];
                 fs_1.default.rmSync(orgSessionDir, { recursive: true, force: true });
                 await supabase_1.supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "disconnected" }, { onConflict: "org_id" });
             }
@@ -215,46 +245,83 @@ const logoutSession = async (orgId) => {
 };
 exports.logoutSession = logoutSession;
 const sendMessage = async (orgId, phone, text, documentUrl, fileName, documentBase64) => {
-    let sock = exports.activeSessions[orgId];
-    if (!sock) {
-        const status = await (0, exports.getSessionStatus)(orgId);
-        if (status === "connected") {
-            await (0, exports.startWhatsAppSession)(orgId);
-        }
-    }
-    // Wait for the connection to be fully open before attempting to send
-    let retries = 15;
-    while (exports.connectionStates[orgId] !== "open" && retries > 0) {
-        await new Promise((r) => setTimeout(r, 1000));
-        retries--;
-    }
-    sock = exports.activeSessions[orgId];
-    if (!sock || exports.connectionStates[orgId] !== "open") {
-        throw new Error(`WhatsApp not ready. Current state: ${exports.connectionStates[orgId] || 'unknown'}. Please wait a few seconds and try again.`);
-    }
     const normalizedPhone = phone.length === 10 ? `91${phone}` : phone;
     const jid = `${normalizedPhone}@s.whatsapp.net`;
+    // Ensure we have an active socket - start one if needed
+    const ensureSocket = async () => {
+        let sock = exports.activeSessions[orgId];
+        if (!sock) {
+            const status = await (0, exports.getSessionStatus)(orgId);
+            if (status === "connected" || status === "authenticating") {
+                await (0, exports.startWhatsAppSession)(orgId);
+            }
+        }
+        // Wait up to 10 seconds for socket to appear and connection to open
+        for (let i = 0; i < 10; i++) {
+            sock = exports.activeSessions[orgId];
+            if (sock && exports.connectionStates[orgId] === "open")
+                return sock;
+            await new Promise(r => setTimeout(r, 1000));
+        }
+        // Return whatever we have - trySend will handle failures
+        sock = exports.activeSessions[orgId];
+        if (sock)
+            return sock;
+        throw new Error("WhatsApp not connected. Please go to Settings and reconnect.");
+    };
+    // Try to send, retry up to 3 times with increasing delay
+    const trySend = async (msgContent) => {
+        const maxRetries = 3;
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                const sock = await ensureSocket();
+                return await sock.sendMessage(jid, msgContent);
+            }
+            catch (err) {
+                console.error(`[${orgId}] Send attempt ${attempt}/${maxRetries} failed:`, err?.message);
+                if (attempt === maxRetries)
+                    throw err;
+                // Wait with increasing delay: 3s, 6s, 9s
+                const delay = attempt * 3000;
+                console.log(`[${orgId}] Retrying in ${delay / 1000}s...`);
+                await new Promise(r => setTimeout(r, delay));
+                // Force reconnect if connection is dead
+                if (exports.connectionStates[orgId] !== "open") {
+                    console.log(`[${orgId}] Forcing reconnect...`);
+                    try {
+                        await (0, exports.startWhatsAppSession)(orgId);
+                    }
+                    catch (e) { }
+                    // Wait for reconnection
+                    for (let i = 0; i < 8; i++) {
+                        if (exports.connectionStates[orgId] === "open")
+                            break;
+                        await new Promise(r => setTimeout(r, 1000));
+                    }
+                }
+            }
+        }
+    };
     let result;
+    // Send text message first
+    if (text) {
+        result = await trySend({ text });
+    }
+    // Then send document separately if provided
     if (documentBase64) {
-        // Strip data URL prefix if present
         const base64Data = documentBase64.includes(',') ? documentBase64.split(',')[1] : documentBase64;
-        result = await sock.sendMessage(jid, {
+        result = await trySend({
             document: Buffer.from(base64Data, 'base64'),
             mimetype: 'application/pdf',
-            fileName: fileName || 'Document.pdf',
-            caption: text
+            fileName: fileName || 'Document.pdf'
         });
     }
     else if (documentUrl) {
-        result = await sock.sendMessage(jid, {
+        result = await trySend({
             document: { url: documentUrl },
             mimetype: 'application/pdf',
-            fileName: fileName || 'Document.pdf',
-            caption: text
+            fileName: fileName || 'Document.pdf'
         });
-    }
-    else {
-        result = await sock.sendMessage(jid, { text });
     }
     // Log it to DB
     let { data: chat } = await supabase_1.supabase
