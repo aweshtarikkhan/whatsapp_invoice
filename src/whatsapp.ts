@@ -22,6 +22,7 @@ if (!fs.existsSync(sessionsDir)) {
 // Memory store to hold active sockets and QR codes
 export const activeSessions: Record<string, ReturnType<typeof makeWASocket>> = {};
 export const qrCodes: Record<string, string> = {}; // Base64 QR codes
+export const connectionStates: Record<string, string> = {}; // "connecting", "open", "close"
 
 export const getSessionStatus = async (orgId: string) => {
   const { data } = await supabase.from("whatsapp_sessions").select("status").eq("org_id", orgId).single();
@@ -52,6 +53,10 @@ export const startWhatsAppSession = async (orgId: string) => {
 
   sock.ev.on("connection.update", async (update) => {
     const { connection, lastDisconnect, qr } = update;
+
+    if (connection) {
+      connectionStates[orgId] = connection;
+    }
 
     if (qr) {
       console.log(`[${orgId}] New QR Code generated.`);
@@ -201,19 +206,24 @@ export const sendMessage = async (orgId: string, phone: string, text: string, do
     const status = await getSessionStatus(orgId);
     if (status === "connected") {
       await startWhatsAppSession(orgId);
-      // Wait a moment for it to initialize
-      let retries = 5;
-      while (!activeSessions[orgId] && retries > 0) {
-        await new Promise((r) => setTimeout(r, 1000));
-        retries--;
-      }
-      sock = activeSessions[orgId];
     }
   }
   
-  if (!sock) throw new Error("WhatsApp not connected for this organization.");
+  // Wait for the connection to be fully open before attempting to send
+  let retries = 15;
+  while (connectionStates[orgId] !== "open" && retries > 0) {
+    await new Promise((r) => setTimeout(r, 1000));
+    retries--;
+  }
 
-  const jid = `${phone}@s.whatsapp.net`;
+  sock = activeSessions[orgId];
+  
+  if (!sock || connectionStates[orgId] !== "open") {
+    throw new Error(`WhatsApp not ready. Current state: ${connectionStates[orgId] || 'unknown'}. Please wait a few seconds and try again.`);
+  }
+  
+  const normalizedPhone = phone.length === 10 ? `91${phone}` : phone;
+  const jid = `${normalizedPhone}@s.whatsapp.net`;
   
   let result;
   if (documentBase64) {
