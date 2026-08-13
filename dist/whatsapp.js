@@ -75,6 +75,9 @@ const startWhatsAppSession = async (orgId) => {
         delete reconnectTimers[orgId];
     }
     const orgSessionDir = path_1.default.join(sessionsDir, orgId);
+    if (!fs_1.default.existsSync(orgSessionDir)) {
+        fs_1.default.mkdirSync(orgSessionDir, { recursive: true });
+    }
     const { state, saveCreds } = await (0, baileys_1.useMultiFileAuthState)(orgSessionDir);
     const { version, isLatest } = await (0, baileys_1.fetchLatestBaileysVersion)();
     const sock = (0, baileys_1.default)({
@@ -107,36 +110,39 @@ const startWhatsAppSession = async (orgId) => {
             const shouldReconnect = statusCode !== baileys_1.DisconnectReason.loggedOut &&
                 statusCode !== 440;
             console.log(`[${orgId}] Connection closed (code: ${statusCode}), reconnecting: ${shouldReconnect}`);
-            // If this close event is from an OLD socket (we already created a new one), ignore it
-            if (exports.activeSessions[orgId] !== sock) {
-                console.log(`[${orgId}] Ignoring close from stale socket.`);
-                return;
-            }
-            if (shouldReconnect) {
-                // Debounced reconnect: wait 5 seconds, only one reconnect at a time
-                if (!reconnectTimers[orgId]) {
-                    reconnectTimers[orgId] = setTimeout(async () => {
-                        delete reconnectTimers[orgId];
-                        // Double-check this socket is still the active one
-                        if (exports.activeSessions[orgId] !== sock)
-                            return;
-                        console.log(`[${orgId}] Attempting reconnect...`);
-                        try {
-                            await (0, exports.startWhatsAppSession)(orgId);
-                        }
-                        catch (e) {
-                            console.error(`[${orgId}] Reconnect failed:`, e);
-                        }
-                    }, 5000);
-                }
-            }
-            else {
+            if (statusCode === baileys_1.DisconnectReason.loggedOut) {
                 console.log(`[${orgId}] Logged out. Deleting session.`);
                 delete exports.activeSessions[orgId];
                 delete exports.qrCodes[orgId];
                 delete exports.connectionStates[orgId];
-                fs_1.default.rmSync(orgSessionDir, { recursive: true, force: true });
+                if (fs_1.default.existsSync(orgSessionDir)) {
+                    fs_1.default.rmSync(orgSessionDir, { recursive: true, force: true });
+                }
                 await supabase_1.supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "disconnected" }, { onConflict: "org_id" });
+                return;
+            }
+            // If connection was replaced (440), or this is a stale socket, we don't reconnect and we don't delete.
+            if (statusCode === 440 || exports.activeSessions[orgId] !== sock) {
+                console.log(`[${orgId}] Connection replaced or stale socket closed. Ignoring.`);
+                return;
+            }
+            // Otherwise, attempt to reconnect
+            console.log(`[${orgId}] Connection closed (code: ${statusCode}), reconnecting...`);
+            // Debounced reconnect: wait 5 seconds, only one reconnect at a time
+            if (!reconnectTimers[orgId]) {
+                reconnectTimers[orgId] = setTimeout(async () => {
+                    delete reconnectTimers[orgId];
+                    // Double-check this socket is still the active one
+                    if (exports.activeSessions[orgId] !== sock)
+                        return;
+                    console.log(`[${orgId}] Attempting reconnect...`);
+                    try {
+                        await (0, exports.startWhatsAppSession)(orgId);
+                    }
+                    catch (e) {
+                        console.error(`[${orgId}] Reconnect failed:`, e);
+                    }
+                }, 5000);
             }
         }
         else if (connection === "open") {

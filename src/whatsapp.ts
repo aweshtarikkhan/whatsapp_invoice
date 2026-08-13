@@ -47,6 +47,9 @@ export const startWhatsAppSession = async (orgId: string) => {
   }
   
   const orgSessionDir = path.join(sessionsDir, orgId);
+  if (!fs.existsSync(orgSessionDir)) {
+    fs.mkdirSync(orgSessionDir, { recursive: true });
+  }
   const { state, saveCreds } = await useMultiFileAuthState(orgSessionDir);
   const { version, isLatest } = await fetchLatestBaileysVersion();
 
@@ -90,34 +93,39 @@ export const startWhatsAppSession = async (orgId: string) => {
       
       console.log(`[${orgId}] Connection closed (code: ${statusCode}), reconnecting: ${shouldReconnect}`);
       
-      // If this close event is from an OLD socket (we already created a new one), ignore it
-      if (activeSessions[orgId] !== sock) {
-        console.log(`[${orgId}] Ignoring close from stale socket.`);
-        return;
-      }
-      
-      if (shouldReconnect) {
-        // Debounced reconnect: wait 5 seconds, only one reconnect at a time
-        if (!reconnectTimers[orgId]) {
-          reconnectTimers[orgId] = setTimeout(async () => {
-            delete reconnectTimers[orgId];
-            // Double-check this socket is still the active one
-            if (activeSessions[orgId] !== sock) return;
-            console.log(`[${orgId}] Attempting reconnect...`);
-            try {
-              await startWhatsAppSession(orgId);
-            } catch (e) {
-              console.error(`[${orgId}] Reconnect failed:`, e);
-            }
-          }, 5000);
-        }
-      } else {
+      if (statusCode === DisconnectReason.loggedOut) {
         console.log(`[${orgId}] Logged out. Deleting session.`);
         delete activeSessions[orgId];
         delete qrCodes[orgId];
         delete connectionStates[orgId];
-        fs.rmSync(orgSessionDir, { recursive: true, force: true });
+        if (fs.existsSync(orgSessionDir)) {
+          fs.rmSync(orgSessionDir, { recursive: true, force: true });
+        }
         await supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "disconnected" }, { onConflict: "org_id" });
+        return;
+      }
+
+      // If connection was replaced (440), or this is a stale socket, we don't reconnect and we don't delete.
+      if (statusCode === 440 || activeSessions[orgId] !== sock) {
+        console.log(`[${orgId}] Connection replaced or stale socket closed. Ignoring.`);
+        return;
+      }
+
+      // Otherwise, attempt to reconnect
+      console.log(`[${orgId}] Connection closed (code: ${statusCode}), reconnecting...`);
+      // Debounced reconnect: wait 5 seconds, only one reconnect at a time
+      if (!reconnectTimers[orgId]) {
+        reconnectTimers[orgId] = setTimeout(async () => {
+          delete reconnectTimers[orgId];
+          // Double-check this socket is still the active one
+          if (activeSessions[orgId] !== sock) return;
+          console.log(`[${orgId}] Attempting reconnect...`);
+          try {
+            await startWhatsAppSession(orgId);
+          } catch (e) {
+            console.error(`[${orgId}] Reconnect failed:`, e);
+          }
+        }, 5000);
       }
     } else if (connection === "open") {
       console.log(`[${orgId}] Connected to WhatsApp!`);
