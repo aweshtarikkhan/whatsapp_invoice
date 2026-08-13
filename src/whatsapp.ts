@@ -209,17 +209,19 @@ export const sendMessage = async (orgId: string, phone: string, text: string, do
     }
   }
   
-  // Wait for the connection to be fully open before attempting to send
-  let retries = 15;
-  while (connectionStates[orgId] !== "open" && retries > 0) {
-    await new Promise((r) => setTimeout(r, 1000));
-    retries--;
+  // Give connection a brief moment to become ready if it's still connecting
+  if (connectionStates[orgId] !== "open") {
+    let waitAttempts = 20;
+    while (connectionStates[orgId] !== "open" && waitAttempts > 0) {
+      await new Promise((r) => setTimeout(r, 1500));
+      waitAttempts--;
+    }
   }
 
   sock = activeSessions[orgId];
   
-  if (!sock || connectionStates[orgId] !== "open") {
-    throw new Error(`WhatsApp not ready. Current state: ${connectionStates[orgId] || 'unknown'}. Please wait a few seconds and try again.`);
+  if (!sock) {
+    throw new Error("WhatsApp not connected. Please reconnect from Settings.");
   }
   
   const normalizedPhone = phone.length === 10 ? `91${phone}` : phone;
