@@ -89,8 +89,23 @@ export const startWhatsAppSession = async (orgId: string) => {
       if (msg.key.fromMe) continue;
       if (isJidBroadcast(msg.key.remoteJid || "")) continue;
       if (msg.key.remoteJid?.includes("@g.us")) continue; // Ignore groups
+      if (msg.key.remoteJid?.endsWith("@lid")) continue; // Ignore WhatsApp Privacy/Device LIDs
+      if (!msg.key.remoteJid?.endsWith("@s.whatsapp.net")) continue; // Only accept direct user phone numbers
 
-      const phone = msg.key.remoteJid?.split("@")[0];
+      // Check if message is forwarded
+      const contextInfo = 
+        msg.message?.extendedTextMessage?.contextInfo ||
+        msg.message?.imageMessage?.contextInfo ||
+        msg.message?.videoMessage?.contextInfo ||
+        msg.message?.documentMessage?.contextInfo ||
+        msg.message?.audioMessage?.contextInfo;
+
+      if (contextInfo?.isForwarded) {
+        console.log(`[${orgId}] Ignoring forwarded message from ${msg.key.remoteJid}`);
+        continue;
+      }
+
+      const phone = msg.key.remoteJid.split("@")[0];
       if (!phone) continue;
 
       const content = msg.message?.conversation || msg.message?.extendedTextMessage?.text || "[Media/Other]";
@@ -147,12 +162,32 @@ export const logoutSession = async (orgId: string) => {
   await supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "disconnected" }, { onConflict: "org_id" });
 };
 
-export const sendMessage = async (orgId: string, phone: string, text: string) => {
+export const sendMessage = async (orgId: string, phone: string, text: string, documentUrl?: string, fileName?: string, documentBase64?: string) => {
   const sock = activeSessions[orgId];
   if (!sock) throw new Error("WhatsApp not connected for this organization.");
 
   const jid = `${phone}@s.whatsapp.net`;
-  const result = await sock.sendMessage(jid, { text });
+  
+  let result;
+  if (documentBase64) {
+    // Strip data URL prefix if present
+    const base64Data = documentBase64.includes(',') ? documentBase64.split(',')[1] : documentBase64;
+    result = await sock.sendMessage(jid, { 
+      document: Buffer.from(base64Data, 'base64'), 
+      mimetype: 'application/pdf', 
+      fileName: fileName || 'Document.pdf',
+      caption: text
+    });
+  } else if (documentUrl) {
+    result = await sock.sendMessage(jid, { 
+      document: { url: documentUrl }, 
+      mimetype: 'application/pdf', 
+      fileName: fileName || 'Document.pdf',
+      caption: text
+    });
+  } else {
+    result = await sock.sendMessage(jid, { text });
+  }
   
   // Log it to DB
   let { data: chat } = await supabase
@@ -177,7 +212,7 @@ export const sendMessage = async (orgId: string, phone: string, text: string) =>
     await supabase.from("whatsapp_messages").insert({
       chat_id: chat.id,
       sender: "me",
-      content: text,
+      content: (documentUrl || documentBase64) ? `[Document: ${fileName || 'Document.pdf'}]\n${text}` : text,
       timestamp: new Date().toISOString(),
       status: "sent"
     });

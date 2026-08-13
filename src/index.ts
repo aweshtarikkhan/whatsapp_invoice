@@ -14,7 +14,7 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 const PORT = process.env.PORT || 3001;
 
@@ -69,9 +69,10 @@ app.post("/api/session/:org_id/logout", async (req, res) => {
 });
 
 app.post("/api/message/send", async (req, res) => {
-  const { org_id, phone, text } = req.body;
+  const { org_id, phone, text, documentUrl, fileName, documentBase64 } = req.body;
+  console.log("Received send request:", { org_id, phone, textLen: text?.length, hasDocUrl: !!documentUrl, hasBase64: !!documentBase64, fileName });
   
-  if (!org_id || !phone || !text) {
+  if (!org_id || !phone || (!text && !documentUrl && !documentBase64)) {
     return res.status(400).json({ error: "Missing required fields" });
   }
 
@@ -87,7 +88,7 @@ app.post("/api/message/send", async (req, res) => {
     }
 
     // 2. Send message via Baileys
-    const result = await sendMessage(org_id, phone, text);
+    const result = await sendMessage(org_id, phone, text || "", documentUrl, fileName, documentBase64);
     res.status(200).json({ success: true, result });
   } catch (err: any) {
     console.error(`Send message error for ${org_id}:`, err);
