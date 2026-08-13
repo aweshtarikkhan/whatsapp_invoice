@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import WebSocket from "ws";
 import dotenv from "dotenv";
 
 dotenv.config();
@@ -11,4 +12,12 @@ if (!supabaseUrl || !supabaseServiceKey) {
 }
 
 // We need the service role key to bypass RLS since this is a backend microservice
-export const supabase = createClient(supabaseUrl, supabaseServiceKey);
+export const supabase = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: { persistSession: false },
+  global: {
+    fetch: fetch,
+  },
+  realtime: {
+    transport: WebSocket
+  }
+});
