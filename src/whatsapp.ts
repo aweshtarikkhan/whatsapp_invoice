@@ -114,12 +114,22 @@ export const startWhatsAppSession = async (orgId: string) => {
 
       console.log(`[${orgId}] Received message from ${phone}: ${content}`);
 
+        // Check if phone matches any known client (try both with and without 91)
+        const phone10 = phone.length === 12 && phone.startsWith("91") ? phone.substring(2) : phone;
+        const { data: clients } = await supabase
+          .from("clients")
+          .select("display_name")
+          .eq("org_id", orgId)
+          .in("phone", [phone, phone10]);
+
+        const clientObj = clients && clients.length > 0 ? clients[0] : null;
+
         // Find or create chat
         let { data: chat } = await supabase
           .from("whatsapp_chats")
           .select("id, client_name")
           .eq("org_id", orgId)
-          .eq("client_phone", phone)
+          .in("client_phone", [phone, phone10])
           .is("archived_session", null)
           .maybeSingle();
   
@@ -236,13 +246,15 @@ export const sendMessage = async (orgId: string, phone: string, text: string, do
     .maybeSingle();
 
   if (!chat) {
-    // Attempt to fetch client name if possible
-    const { data: clientObj } = await supabase
+    // Attempt to fetch client name if possible (try both with and without 91)
+    const phone10 = phone.length === 12 && phone.startsWith("91") ? phone.substring(2) : phone;
+    const { data: clients } = await supabase
       .from("clients")
       .select("display_name")
       .eq("org_id", orgId)
-      .eq("phone", phone)
-      .maybeSingle();
+      .in("phone", [phone, phone10]);
+
+    const clientObj = clients && clients.length > 0 ? clients[0] : null;
 
     const { data: newChat } = await supabase
       .from("whatsapp_chats")
