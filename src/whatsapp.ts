@@ -114,22 +114,19 @@ export const startWhatsAppSession = async (orgId: string) => {
 
       console.log(`[${orgId}] Received message from ${phone}: ${content}`);
 
-      // Find or create chat
-      let { data: chat } = await supabase
-        .from("whatsapp_chats")
-        .select("id")
-        .eq("org_id", orgId)
-        .eq("client_phone", phone)
-        .single();
-
-      if (!chat) {
-        const { data: newChat } = await supabase
+        // Find or create chat
+        let { data: chat } = await supabase
           .from("whatsapp_chats")
-          .insert({ org_id: orgId, client_phone: phone, client_name: pushName, last_message_at: timestamp, unread_count: 1 })
-          .select("id")
-          .single();
-        chat = newChat;
-      } else {
+          .select("id, client_name")
+          .eq("org_id", orgId)
+          .eq("client_phone", phone)
+          .is("archived_session", null)
+          .maybeSingle();
+  
+        if (!chat) {
+          console.log(`[${orgId}] Ignoring incoming message from uninitiated number ${phone}`);
+          continue;
+        } else {
         await supabase.rpc("increment_unread", { chat_id: chat.id });
         await supabase.from("whatsapp_chats").update({ last_message_at: timestamp }).eq("id", chat.id);
       }
@@ -149,6 +146,29 @@ export const startWhatsAppSession = async (orgId: string) => {
   return sock;
 };
 
+export const restoreSessions = async () => {
+  try {
+    const { data: sessions, error } = await supabase.from("whatsapp_sessions").select("org_id").eq("status", "connected");
+    if (error) {
+      console.error("Failed to fetch sessions to restore:", error);
+      return;
+    }
+    
+    if (sessions && sessions.length > 0) {
+      console.log(`Restoring ${sessions.length} WhatsApp sessions...`);
+      for (const session of sessions) {
+        if (!activeSessions[session.org_id]) {
+          await startWhatsAppSession(session.org_id).catch(err => {
+            console.error(`Failed to restore session for ${session.org_id}:`, err);
+          });
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Error restoring sessions:", err);
+  }
+};
+
 export const logoutSession = async (orgId: string) => {
   const sock = activeSessions[orgId];
   if (sock) {
@@ -160,10 +180,27 @@ export const logoutSession = async (orgId: string) => {
     fs.rmSync(orgSessionDir, { recursive: true, force: true });
   }
   await supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "disconnected" }, { onConflict: "org_id" });
+  
+  // Archive existing chats for this organization
+  await supabase.rpc("archive_whatsapp_session", { p_org_id: orgId });
 };
 
 export const sendMessage = async (orgId: string, phone: string, text: string, documentUrl?: string, fileName?: string, documentBase64?: string) => {
-  const sock = activeSessions[orgId];
+  let sock = activeSessions[orgId];
+  if (!sock) {
+    const status = await getSessionStatus(orgId);
+    if (status === "connected") {
+      await startWhatsAppSession(orgId);
+      // Wait a moment for it to initialize
+      let retries = 5;
+      while (!activeSessions[orgId] && retries > 0) {
+        await new Promise((r) => setTimeout(r, 1000));
+        retries--;
+      }
+      sock = activeSessions[orgId];
+    }
+  }
+  
   if (!sock) throw new Error("WhatsApp not connected for this organization.");
 
   const jid = `${phone}@s.whatsapp.net`;
@@ -195,12 +232,21 @@ export const sendMessage = async (orgId: string, phone: string, text: string, do
     .select("id")
     .eq("org_id", orgId)
     .eq("client_phone", phone)
-    .single();
+    .is("archived_session", null)
+    .maybeSingle();
 
   if (!chat) {
+    // Attempt to fetch client name if possible
+    const { data: clientObj } = await supabase
+      .from("clients")
+      .select("display_name")
+      .eq("org_id", orgId)
+      .eq("phone", phone)
+      .maybeSingle();
+
     const { data: newChat } = await supabase
       .from("whatsapp_chats")
-      .insert({ org_id: orgId, client_phone: phone, last_message_at: new Date().toISOString() })
+      .insert({ org_id: orgId, client_phone: phone, client_name: clientObj?.display_name || null, last_message_at: new Date().toISOString() })
       .select("id")
       .single();
     chat = newChat;

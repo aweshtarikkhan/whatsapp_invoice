@@ -6,7 +6,8 @@ import {
   startWhatsAppSession,
   qrCodes,
   logoutSession,
-  sendMessage
+  sendMessage,
+  restoreSessions
 } from "./whatsapp";
 import { supabase } from "./supabase";
 
@@ -14,7 +15,8 @@ dotenv.config();
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 const PORT = process.env.PORT || 3001;
 
@@ -103,4 +105,7 @@ app.post("/api/message/send", async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`WhatsApp Microservice running on port ${PORT}`);
+  
+  // Restore connected sessions on startup
+  restoreSessions();
 });

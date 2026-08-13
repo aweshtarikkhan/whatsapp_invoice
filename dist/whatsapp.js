@@ -36,7 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendMessage = exports.logoutSession = exports.startWhatsAppSession = exports.getSessionStatus = exports.qrCodes = exports.activeSessions = void 0;
+exports.sendMessage = exports.logoutSession = exports.restoreSessions = exports.startWhatsAppSession = exports.getSessionStatus = exports.qrCodes = exports.activeSessions = void 0;
 const baileys_1 = __importStar(require("@whiskeysockets/baileys"));
 const pino_1 = __importDefault(require("pino"));
 const qrcode_1 = __importDefault(require("qrcode"));
@@ -167,6 +167,29 @@ const startWhatsAppSession = async (orgId) => {
     return sock;
 };
 exports.startWhatsAppSession = startWhatsAppSession;
+const restoreSessions = async () => {
+    try {
+        const { data: sessions, error } = await supabase_1.supabase.from("whatsapp_sessions").select("org_id").eq("status", "connected");
+        if (error) {
+            console.error("Failed to fetch sessions to restore:", error);
+            return;
+        }
+        if (sessions && sessions.length > 0) {
+            console.log(`Restoring ${sessions.length} WhatsApp sessions...`);
+            for (const session of sessions) {
+                if (!exports.activeSessions[session.org_id]) {
+                    await (0, exports.startWhatsAppSession)(session.org_id).catch(err => {
+                        console.error(`Failed to restore session for ${session.org_id}:`, err);
+                    });
+                }
+            }
+        }
+    }
+    catch (err) {
+        console.error("Error restoring sessions:", err);
+    }
+};
+exports.restoreSessions = restoreSessions;
 const logoutSession = async (orgId) => {
     const sock = exports.activeSessions[orgId];
     if (sock) {
@@ -181,7 +204,20 @@ const logoutSession = async (orgId) => {
 };
 exports.logoutSession = logoutSession;
 const sendMessage = async (orgId, phone, text, documentUrl, fileName, documentBase64) => {
-    const sock = exports.activeSessions[orgId];
+    let sock = exports.activeSessions[orgId];
+    if (!sock) {
+        const status = await (0, exports.getSessionStatus)(orgId);
+        if (status === "connected") {
+            await (0, exports.startWhatsAppSession)(orgId);
+            // Wait a moment for it to initialize
+            let retries = 5;
+            while (!exports.activeSessions[orgId] && retries > 0) {
+                await new Promise((r) => setTimeout(r, 1000));
+                retries--;
+            }
+            sock = exports.activeSessions[orgId];
+        }
+    }
     if (!sock)
         throw new Error("WhatsApp not connected for this organization.");
     const jid = `${phone}@s.whatsapp.net`;

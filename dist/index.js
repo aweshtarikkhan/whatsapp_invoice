@@ -91,4 +91,6 @@ app.post("/api/message/send", async (req, res) => {
 });
 app.listen(PORT, () => {
     console.log(`WhatsApp Microservice running on port ${PORT}`);
+    // Restore connected sessions on startup
+    (0, whatsapp_1.restoreSessions)();
 });
