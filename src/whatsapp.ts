@@ -231,54 +231,55 @@ export const logoutSession = async (orgId: string) => {
 };
 
 export const sendMessage = async (orgId: string, phone: string, text: string, documentUrl?: string, fileName?: string, documentBase64?: string) => {
-  let sock = activeSessions[orgId];
-  if (!sock) {
-    const status = await getSessionStatus(orgId);
-    if (status === "connected") {
-      await startWhatsAppSession(orgId);
-    }
-  }
-  
-  // Give connection a brief moment to become ready if it's still connecting
-  if (connectionStates[orgId] !== "open") {
-    let waitAttempts = 20;
-    while (connectionStates[orgId] !== "open" && waitAttempts > 0) {
-      await new Promise((r) => setTimeout(r, 1500));
-      waitAttempts--;
-    }
-  }
-
-  sock = activeSessions[orgId];
-  
-  if (!sock) {
-    throw new Error("WhatsApp not connected. Please reconnect from Settings.");
-  }
-  
   const normalizedPhone = phone.length === 10 ? `91${phone}` : phone;
   const jid = `${normalizedPhone}@s.whatsapp.net`;
-  
-  // Helper: attempt to send with retry on Connection Closed
-  const trySend = async (msgContent: any, maxRetries = 3): Promise<any> => {
+
+  // Ensure we have an active socket - start one if needed
+  const ensureSocket = async (): Promise<ReturnType<typeof makeWASocket>> => {
+    let sock = activeSessions[orgId];
+    if (!sock) {
+      const status = await getSessionStatus(orgId);
+      if (status === "connected" || status === "authenticating") {
+        await startWhatsAppSession(orgId);
+      }
+    }
+    // Wait up to 10 seconds for socket to appear and connection to open
+    for (let i = 0; i < 10; i++) {
+      sock = activeSessions[orgId];
+      if (sock && connectionStates[orgId] === "open") return sock;
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    // Return whatever we have - trySend will handle failures
+    sock = activeSessions[orgId];
+    if (sock) return sock;
+    throw new Error("WhatsApp not connected. Please go to Settings and reconnect.");
+  };
+
+  // Try to send, retry up to 3 times with increasing delay
+  const trySend = async (msgContent: any): Promise<any> => {
+    const maxRetries = 3;
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       try {
-        const currentSock = activeSessions[orgId];
-        if (!currentSock) throw new Error("Socket lost");
-        return await currentSock.sendMessage(jid, msgContent);
+        const sock = await ensureSocket();
+        return await sock.sendMessage(jid, msgContent);
       } catch (err: any) {
-        const errMsg = (err?.message || "").toLowerCase();
-        console.error(`[${orgId}] Send attempt ${attempt}/${maxRetries} failed:`, errMsg);
-        
+        console.error(`[${orgId}] Send attempt ${attempt}/${maxRetries} failed:`, err?.message);
         if (attempt === maxRetries) throw err;
         
-        // Wait for Baileys auto-reconnect
-        console.log(`[${orgId}] Waiting for reconnect before retry...`);
-        let waitRetries = 10;
-        while (connectionStates[orgId] !== "open" && waitRetries > 0) {
-          await new Promise((r) => setTimeout(r, 2000));
-          waitRetries--;
-        }
+        // Wait with increasing delay: 3s, 6s, 9s
+        const delay = attempt * 3000;
+        console.log(`[${orgId}] Retrying in ${delay/1000}s...`);
+        await new Promise(r => setTimeout(r, delay));
+        
+        // Force reconnect if connection is dead
         if (connectionStates[orgId] !== "open") {
-          throw new Error("WhatsApp connection could not be restored. Please reconnect from Settings.");
+          console.log(`[${orgId}] Forcing reconnect...`);
+          try { await startWhatsAppSession(orgId); } catch(e) {}
+          // Wait for reconnection
+          for (let i = 0; i < 8; i++) {
+            if (connectionStates[orgId] === "open") break;
+            await new Promise(r => setTimeout(r, 1000));
+          }
         }
       }
     }
@@ -286,7 +287,7 @@ export const sendMessage = async (orgId: string, phone: string, text: string, do
 
   let result;
   
-  // Send text message first (lightweight, likely to succeed)
+  // Send text message first
   if (text) {
     result = await trySend({ text });
   }
