@@ -13,6 +13,10 @@ const app = (0, express_1.default)();
 app.use((0, cors_1.default)());
 app.use(express_1.default.json({ limit: '10mb' }));
 const PORT = process.env.PORT || 3001;
+// Health check for aaPanel
+app.get("/", (req, res) => {
+    res.status(200).send("WhatsApp Microservice is running!");
+});
 app.get("/api/session/:org_id/qr", async (req, res) => {
     const orgId = req.params.org_id;
     try {
