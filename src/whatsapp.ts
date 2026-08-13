@@ -120,69 +120,93 @@ export const startWhatsAppSession = async (orgId: string) => {
     for (const msg of messages) {
       if (!msg.message) continue;
       if (msg.key.fromMe) continue;
-      if (isJidBroadcast(msg.key.remoteJid || "")) continue;
-      if (msg.key.remoteJid?.includes("@g.us")) continue; // Ignore groups
-      if (msg.key.remoteJid?.endsWith("@lid")) continue; // Ignore WhatsApp Privacy/Device LIDs
-      if (!msg.key.remoteJid?.endsWith("@s.whatsapp.net")) continue; // Only accept direct user phone numbers
+      
+      let rawJid = msg.key.remoteJid || "";
+      if (isJidBroadcast(rawJid)) continue;
+      if (rawJid.includes("@g.us")) continue; // Ignore groups
+
+      // If remoteJid is @lid, try using key.participant if it has phone JID
+      if (rawJid.endsWith("@lid")) {
+        if (msg.key.participant && msg.key.participant.includes("@s.whatsapp.net")) {
+          rawJid = msg.key.participant;
+        } else {
+          // If pure @lid without participant, skip
+          console.log(`[${orgId}] Skipping @lid message without participant: ${rawJid}`);
+          continue;
+        }
+      }
+
+      // Extract pure phone number (strip device suffix like :12 and domain @s.whatsapp.net)
+      const phoneDigits = rawJid.split("@")[0].split(":")[0].replace(/\D/g, "");
+      if (!phoneDigits) continue;
+
+      // Unwrap ephemeral, viewOnce, or nested message wrappers
+      const realMsg = msg.message?.ephemeralMessage?.message ||
+                      msg.message?.viewOnceMessage?.message ||
+                      msg.message?.viewOnceMessageV2?.message ||
+                      msg.message?.documentWithCaptionMessage?.message ||
+                      msg.message;
 
       // Check if message is forwarded
       const contextInfo = 
-        msg.message?.extendedTextMessage?.contextInfo ||
-        msg.message?.imageMessage?.contextInfo ||
-        msg.message?.videoMessage?.contextInfo ||
-        msg.message?.documentMessage?.contextInfo ||
-        msg.message?.audioMessage?.contextInfo;
+        realMsg?.extendedTextMessage?.contextInfo ||
+        realMsg?.imageMessage?.contextInfo ||
+        realMsg?.videoMessage?.contextInfo ||
+        realMsg?.documentMessage?.contextInfo ||
+        realMsg?.audioMessage?.contextInfo;
 
       if (contextInfo?.isForwarded) {
-        console.log(`[${orgId}] Ignoring forwarded message from ${msg.key.remoteJid}`);
+        console.log(`[${orgId}] Ignoring forwarded message from ${phoneDigits}`);
         continue;
       }
 
-      const phone = msg.key.remoteJid.split("@")[0];
-      if (!phone) continue;
+      const content = realMsg?.conversation || 
+                      realMsg?.extendedTextMessage?.text || 
+                      realMsg?.imageMessage?.caption || 
+                      realMsg?.videoMessage?.caption || 
+                      realMsg?.documentMessage?.caption || 
+                      (realMsg?.imageMessage ? "[Photo]" : null) || 
+                      (realMsg?.videoMessage ? "[Video]" : null) || 
+                      (realMsg?.documentMessage ? "[Document]" : null) || 
+                      (realMsg?.audioMessage ? "[Voice Message]" : null) || 
+                      (realMsg?.stickerMessage ? "[Sticker]" : null) || 
+                      "[Message]";
 
-      const content = msg.message?.conversation || msg.message?.extendedTextMessage?.text || "[Media/Other]";
-      const pushName = msg.pushName || phone;
-      const timestamp = new Date((msg.messageTimestamp as number) * 1000).toISOString();
+      const timestamp = new Date((msg.messageTimestamp as number || Math.floor(Date.now() / 1000)) * 1000).toISOString();
 
-      console.log(`[${orgId}] Received message from ${phone}: ${content}`);
+      console.log(`[${orgId}] Received message from ${phoneDigits}: ${content}`);
 
-        // Check if phone matches any known client (try both with and without 91)
-        const phone10 = phone.length === 12 && phone.startsWith("91") ? phone.substring(2) : phone;
-        const { data: clients } = await supabase
-          .from("clients")
-          .select("display_name")
-          .eq("org_id", orgId)
-          .in("phone", [phone, phone10]);
+      // Normalize candidate phone formats for matching DB
+      const phone10 = phoneDigits.length === 12 && phoneDigits.startsWith("91") ? phoneDigits.substring(2) : phoneDigits;
+      const phoneWith91 = phoneDigits.length === 10 ? `91${phoneDigits}` : phoneDigits;
+      const phoneWithPlus = `+${phoneWith91}`;
 
-        const clientObj = clients && clients.length > 0 ? clients[0] : null;
+      const candidatePhones = Array.from(new Set([phoneDigits, phone10, phoneWith91, phoneWithPlus]));
 
-        // Find or create chat
-        let { data: chat } = await supabase
-          .from("whatsapp_chats")
-          .select("id, client_name")
-          .eq("org_id", orgId)
-          .in("client_phone", [phone, phone10])
-          .is("archived_session", null)
-          .maybeSingle();
-  
-        if (!chat) {
-          console.log(`[${orgId}] Ignoring incoming message from uninitiated number ${phone}`);
-          continue;
-        } else {
-        await supabase.rpc("increment_unread", { chat_id: chat.id });
-        await supabase.from("whatsapp_chats").update({ last_message_at: timestamp }).eq("id", chat.id);
+      // Find active chat for this organization
+      let { data: chat } = await supabase
+        .from("whatsapp_chats")
+        .select("id, client_name")
+        .eq("org_id", orgId)
+        .in("client_phone", candidatePhones)
+        .is("archived_session", null)
+        .maybeSingle();
+
+      if (!chat) {
+        console.log(`[${orgId}] Ignoring incoming message from uninitiated number ${phoneDigits} (candidates: ${candidatePhones.join(",")})`);
+        continue;
       }
 
-      if (chat) {
-        await supabase.from("whatsapp_messages").insert({
-          chat_id: chat.id,
-          sender: "client",
-          content,
-          timestamp,
-          status: "delivered"
-        });
-      }
+      await supabase.rpc("increment_unread", { chat_id: chat.id });
+      await supabase.from("whatsapp_chats").update({ last_message_at: timestamp }).eq("id", chat.id);
+
+      await supabase.from("whatsapp_messages").insert({
+        chat_id: chat.id,
+        sender: "client",
+        content,
+        timestamp,
+        status: "delivered"
+      });
     }
   });
 
