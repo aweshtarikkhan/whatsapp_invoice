@@ -83,21 +83,33 @@ export const startWhatsAppSession = async (orgId: string) => {
 
     if (connection === "close") {
       const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      
+      // Don't reconnect if: logged out, or connection was replaced by us (440)
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut && 
+                              statusCode !== 440;
+      
       console.log(`[${orgId}] Connection closed (code: ${statusCode}), reconnecting: ${shouldReconnect}`);
       
+      // If this close event is from an OLD socket (we already created a new one), ignore it
+      if (activeSessions[orgId] !== sock) {
+        console.log(`[${orgId}] Ignoring close from stale socket.`);
+        return;
+      }
+      
       if (shouldReconnect) {
-        // Debounced reconnect: wait 3 seconds, only one reconnect at a time
+        // Debounced reconnect: wait 5 seconds, only one reconnect at a time
         if (!reconnectTimers[orgId]) {
           reconnectTimers[orgId] = setTimeout(async () => {
             delete reconnectTimers[orgId];
+            // Double-check this socket is still the active one
+            if (activeSessions[orgId] !== sock) return;
             console.log(`[${orgId}] Attempting reconnect...`);
             try {
               await startWhatsAppSession(orgId);
             } catch (e) {
               console.error(`[${orgId}] Reconnect failed:`, e);
             }
-          }, 3000);
+          }, 5000);
         }
       } else {
         console.log(`[${orgId}] Logged out. Deleting session.`);
