@@ -36,7 +36,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.sendMessage = exports.logoutSession = exports.restoreSessions = exports.startWhatsAppSession = exports.getSessionStatus = exports.qrCodes = exports.activeSessions = void 0;
+exports.sendMessage = exports.logoutSession = exports.restoreSessions = exports.startWhatsAppSession = exports.getSessionStatus = exports.connectionStates = exports.qrCodes = exports.activeSessions = void 0;
 const baileys_1 = __importStar(require("@whiskeysockets/baileys"));
 const pino_1 = __importDefault(require("pino"));
 const qrcode_1 = __importDefault(require("qrcode"));
@@ -51,6 +51,7 @@ if (!fs_1.default.existsSync(sessionsDir)) {
 // Memory store to hold active sockets and QR codes
 exports.activeSessions = {};
 exports.qrCodes = {}; // Base64 QR codes
+exports.connectionStates = {}; // "connecting", "open", "close"
 const getSessionStatus = async (orgId) => {
     const { data } = await supabase_1.supabase.from("whatsapp_sessions").select("status").eq("org_id", orgId).single();
     return data?.status || "disconnected";
@@ -75,6 +76,9 @@ const startWhatsAppSession = async (orgId) => {
     sock.ev.on("creds.update", saveCreds);
     sock.ev.on("connection.update", async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        if (connection) {
+            exports.connectionStates[orgId] = connection;
+        }
         if (qr) {
             console.log(`[${orgId}] New QR Code generated.`);
             exports.qrCodes[orgId] = await qrcode_1.default.toDataURL(qr);
@@ -134,20 +138,25 @@ const startWhatsAppSession = async (orgId) => {
             const pushName = msg.pushName || phone;
             const timestamp = new Date(msg.messageTimestamp * 1000).toISOString();
             console.log(`[${orgId}] Received message from ${phone}: ${content}`);
+            // Check if phone matches any known client (try both with and without 91)
+            const phone10 = phone.length === 12 && phone.startsWith("91") ? phone.substring(2) : phone;
+            const { data: clients } = await supabase_1.supabase
+                .from("clients")
+                .select("display_name")
+                .eq("org_id", orgId)
+                .in("phone", [phone, phone10]);
+            const clientObj = clients && clients.length > 0 ? clients[0] : null;
             // Find or create chat
             let { data: chat } = await supabase_1.supabase
                 .from("whatsapp_chats")
-                .select("id")
+                .select("id, client_name")
                 .eq("org_id", orgId)
-                .eq("client_phone", phone)
-                .single();
+                .in("client_phone", [phone, phone10])
+                .is("archived_session", null)
+                .maybeSingle();
             if (!chat) {
-                const { data: newChat } = await supabase_1.supabase
-                    .from("whatsapp_chats")
-                    .insert({ org_id: orgId, client_phone: phone, client_name: pushName, last_message_at: timestamp, unread_count: 1 })
-                    .select("id")
-                    .single();
-                chat = newChat;
+                console.log(`[${orgId}] Ignoring incoming message from uninitiated number ${phone}`);
+                continue;
             }
             else {
                 await supabase_1.supabase.rpc("increment_unread", { chat_id: chat.id });
@@ -201,6 +210,8 @@ const logoutSession = async (orgId) => {
         fs_1.default.rmSync(orgSessionDir, { recursive: true, force: true });
     }
     await supabase_1.supabase.from("whatsapp_sessions").upsert({ org_id: orgId, status: "disconnected" }, { onConflict: "org_id" });
+    // Archive existing chats for this organization
+    await supabase_1.supabase.rpc("archive_whatsapp_session", { p_org_id: orgId });
 };
 exports.logoutSession = logoutSession;
 const sendMessage = async (orgId, phone, text, documentUrl, fileName, documentBase64) => {
@@ -209,18 +220,20 @@ const sendMessage = async (orgId, phone, text, documentUrl, fileName, documentBa
         const status = await (0, exports.getSessionStatus)(orgId);
         if (status === "connected") {
             await (0, exports.startWhatsAppSession)(orgId);
-            // Wait a moment for it to initialize
-            let retries = 5;
-            while (!exports.activeSessions[orgId] && retries > 0) {
-                await new Promise((r) => setTimeout(r, 1000));
-                retries--;
-            }
-            sock = exports.activeSessions[orgId];
         }
     }
-    if (!sock)
-        throw new Error("WhatsApp not connected for this organization.");
-    const jid = `${phone}@s.whatsapp.net`;
+    // Wait for the connection to be fully open before attempting to send
+    let retries = 15;
+    while (exports.connectionStates[orgId] !== "open" && retries > 0) {
+        await new Promise((r) => setTimeout(r, 1000));
+        retries--;
+    }
+    sock = exports.activeSessions[orgId];
+    if (!sock || exports.connectionStates[orgId] !== "open") {
+        throw new Error(`WhatsApp not ready. Current state: ${exports.connectionStates[orgId] || 'unknown'}. Please wait a few seconds and try again.`);
+    }
+    const normalizedPhone = phone.length === 10 ? `91${phone}` : phone;
+    const jid = `${normalizedPhone}@s.whatsapp.net`;
     let result;
     if (documentBase64) {
         // Strip data URL prefix if present
@@ -249,11 +262,20 @@ const sendMessage = async (orgId, phone, text, documentUrl, fileName, documentBa
         .select("id")
         .eq("org_id", orgId)
         .eq("client_phone", phone)
-        .single();
+        .is("archived_session", null)
+        .maybeSingle();
     if (!chat) {
+        // Attempt to fetch client name if possible (try both with and without 91)
+        const phone10 = phone.length === 12 && phone.startsWith("91") ? phone.substring(2) : phone;
+        const { data: clients } = await supabase_1.supabase
+            .from("clients")
+            .select("display_name")
+            .eq("org_id", orgId)
+            .in("phone", [phone, phone10]);
+        const clientObj = clients && clients.length > 0 ? clients[0] : null;
         const { data: newChat } = await supabase_1.supabase
             .from("whatsapp_chats")
-            .insert({ org_id: orgId, client_phone: phone, last_message_at: new Date().toISOString() })
+            .insert({ org_id: orgId, client_phone: phone, client_name: clientObj?.display_name || null, last_message_at: new Date().toISOString() })
             .select("id")
             .single();
         chat = newChat;

@@ -11,7 +11,8 @@ const supabase_1 = require("./supabase");
 dotenv_1.default.config();
 const app = (0, express_1.default)();
 app.use((0, cors_1.default)());
-app.use(express_1.default.json({ limit: '10mb' }));
+app.use(express_1.default.json({ limit: '50mb' }));
+app.use(express_1.default.urlencoded({ limit: '50mb', extended: true }));
 const PORT = process.env.PORT || 3001;
 // Health check for aaPanel
 app.get("/", (req, res) => {
