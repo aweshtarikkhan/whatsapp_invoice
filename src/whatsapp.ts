@@ -139,9 +139,11 @@ export const startWhatsAppSession = async (orgId: string) => {
 
     for (const msg of messages) {
       if (!msg.message) continue;
-      if (msg.key.fromMe) continue;
       
       let rawJid = msg.key.remoteJid || "";
+      console.log(`[${orgId}] DEBUG INCOMING RAW - FromMe: ${msg.key.fromMe}, JID: ${rawJid}, Participant: ${msg.key.participant}`);
+      
+      if (msg.key.fromMe) continue;
       if (isJidBroadcast(rawJid)) continue;
       if (rawJid.includes("@g.us")) continue; // Ignore groups
 
@@ -152,6 +154,7 @@ export const startWhatsAppSession = async (orgId: string) => {
         } else {
           // If pure @lid without participant, skip
           console.log(`[${orgId}] Skipping @lid message without participant: ${rawJid}`);
+          console.log(`[${orgId}] FULL LID MESSAGE PAYLOAD: ${JSON.stringify(msg, null, 2)}`);
           continue;
         }
       }
@@ -291,10 +294,9 @@ export const sendMessage = async (orgId: string, phone: string, text: string, do
       if (sock && connectionStates[orgId] === "open") return sock;
       await new Promise(r => setTimeout(r, 1000));
     }
-    // Return whatever we have - trySend will handle failures
-    sock = activeSessions[orgId];
-    if (sock) return sock;
-    throw new Error("WhatsApp not connected. Please go to Settings and reconnect.");
+    
+    // If we get here, it didn't open in time (might be waiting for QR code)
+    throw new Error("WhatsApp session is not fully connected (needs QR scan or still connecting).");
   };
 
   // Try to send, retry up to 3 times with increasing delay
