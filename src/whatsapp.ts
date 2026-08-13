@@ -225,25 +225,54 @@ export const sendMessage = async (orgId: string, phone: string, text: string, do
   const normalizedPhone = phone.length === 10 ? `91${phone}` : phone;
   const jid = `${normalizedPhone}@s.whatsapp.net`;
   
+  // Helper: attempt to send with retry on Connection Closed
+  const trySend = async (msgContent: any, maxRetries = 3): Promise<any> => {
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        const currentSock = activeSessions[orgId];
+        if (!currentSock) throw new Error("Socket lost");
+        return await currentSock.sendMessage(jid, msgContent);
+      } catch (err: any) {
+        const errMsg = (err?.message || "").toLowerCase();
+        console.error(`[${orgId}] Send attempt ${attempt}/${maxRetries} failed:`, errMsg);
+        
+        if (attempt === maxRetries) throw err;
+        
+        // Wait for Baileys auto-reconnect
+        console.log(`[${orgId}] Waiting for reconnect before retry...`);
+        let waitRetries = 10;
+        while (connectionStates[orgId] !== "open" && waitRetries > 0) {
+          await new Promise((r) => setTimeout(r, 2000));
+          waitRetries--;
+        }
+        if (connectionStates[orgId] !== "open") {
+          throw new Error("WhatsApp connection could not be restored. Please reconnect from Settings.");
+        }
+      }
+    }
+  };
+
   let result;
+  
+  // Send text message first (lightweight, likely to succeed)
+  if (text) {
+    result = await trySend({ text });
+  }
+  
+  // Then send document separately if provided
   if (documentBase64) {
-    // Strip data URL prefix if present
     const base64Data = documentBase64.includes(',') ? documentBase64.split(',')[1] : documentBase64;
-    result = await sock.sendMessage(jid, { 
+    result = await trySend({ 
       document: Buffer.from(base64Data, 'base64'), 
       mimetype: 'application/pdf', 
-      fileName: fileName || 'Document.pdf',
-      caption: text
+      fileName: fileName || 'Document.pdf'
     });
   } else if (documentUrl) {
-    result = await sock.sendMessage(jid, { 
+    result = await trySend({ 
       document: { url: documentUrl }, 
       mimetype: 'application/pdf', 
-      fileName: fileName || 'Document.pdf',
-      caption: text
+      fileName: fileName || 'Document.pdf'
     });
-  } else {
-    result = await sock.sendMessage(jid, { text });
   }
   
   // Log it to DB
